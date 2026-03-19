@@ -1,0 +1,36 @@
+[package]
+name = "surveillance_ftp"
+version = "0.1.0"
+edition = "2021"
+description = "Surveillance FTP - Réception, affichage et renvoi d'images via FTP"
+
+[dependencies]
+# GUI
+eframe = "0.31"
+egui = "0.31"
+egui_extras = { version = "0.31", features = ["image"] }
+image = { version = "0.25", features = ["jpeg", "png", "bmp", "tiff", "gif"] }
+
+# FTP client
+suppaftp = "6"
+
+# FTP server
+libunftp = "0.20"
+unftp-sbe-fs = "0.2"
+tokio = { version = "1", features = ["full"] }
+
+# File watching
+notify = "8"
+
+# Config & serialization
+rust-ini = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+chrono = "0.4"
+
+# Misc
+crossbeam-channel = "0.5"
