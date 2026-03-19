@@ -7,6 +7,7 @@ use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 use log::{error, info, warn};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -35,7 +36,33 @@ pub struct ApplicationGUI {
     _surveillant: Option<SurveillantImages>,
     _serveur_handle: Option<std::thread::JoinHandle<()>>,
     upload_sender: Sender<PathBuf>,
-    _worker_handle: Option<std::thread::JoinHandle<()>>,
+    worker_handle: Option<std::thread::JoinHandle<()>>,
+    arret: Arc<AtomicBool>,
+    touche_quitter: egui::Key,
+}
+
+/// Convertit une chaîne de config en egui::Key
+fn parser_touche(nom: &str) -> egui::Key {
+    match nom.to_lowercase().as_str() {
+        "escape" | "echap" => egui::Key::Escape,
+        "f1" => egui::Key::F1,
+        "f2" => egui::Key::F2,
+        "f3" => egui::Key::F3,
+        "f4" => egui::Key::F4,
+        "f5" => egui::Key::F5,
+        "f6" => egui::Key::F6,
+        "f7" => egui::Key::F7,
+        "f8" => egui::Key::F8,
+        "f9" => egui::Key::F9,
+        "f10" => egui::Key::F10,
+        "f11" => egui::Key::F11,
+        "f12" => egui::Key::F12,
+        "q" => egui::Key::Q,
+        _ => {
+            warn!("Touche '{}' non reconnue, utilisation de Escape par défaut", nom);
+            egui::Key::Escape
+        }
+    }
 }
 
 impl ApplicationGUI {
@@ -81,6 +108,9 @@ impl ApplicationGUI {
             ctx: None,
         }));
 
+        // Signal d'arrêt pour les threads
+        let arret = Arc::new(AtomicBool::new(false));
+
         // Canal pour le worker d'upload sérialisé
         let (upload_sender, upload_receiver) = crossbeam_channel::unbounded::<PathBuf>();
 
@@ -88,21 +118,34 @@ impl ApplicationGUI {
         let mut client_ftp = ClientFTP::new(config.ftp_client.clone(), compteur.clone());
         let worker_etat = etat.clone();
         let worker_config = config.clone();
+        let worker_arret = arret.clone();
 
         // Créer le dossier d'envoi une seule fois si configuré
         if let Some(ref dossier) = config.surveillance.dossier_envoye {
             let _ = std::fs::create_dir_all(dossier);
         }
 
+        let timeout_fichier = Duration::from_secs(config.interface.timeout_fichier_secs);
+        let retries = config.interface.retries_upload;
+
+        let touche_quitter = parser_touche(&config.interface.touche_quitter);
+
         let worker_handle = std::thread::spawn(move || {
-            for chemin in upload_receiver {
+            while !worker_arret.load(Ordering::Relaxed) {
+                // Attendre un message avec timeout pour pouvoir vérifier le signal d'arrêt
+                let chemin = match upload_receiver.recv_timeout(Duration::from_secs(1)) {
+                    Ok(c) => c,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                };
+
                 let nom = chemin
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
 
                 // Attendre que le fichier soit complètement écrit
-                if !attendre_fichier_complet(&chemin, Duration::from_secs(15)) {
+                if !attendre_fichier_complet(&chemin, timeout_fichier) {
                     warn!("Fichier incomplet après timeout : {}", chemin.display());
                     let mut etat = worker_etat.lock().unwrap();
                     etat.statut = Statut {
@@ -137,8 +180,8 @@ impl ApplicationGUI {
                     }
                 }
 
-                // Envoyer via FTP (réutilise la connexion existante)
-                let succes = client_ftp.envoyer_donnees(&nom, &image_data);
+                // Envoyer via FTP avec retry
+                let succes = client_ftp.envoyer_avec_retry(&nom, &image_data, retries);
 
                 {
                     let mut etat = worker_etat.lock().unwrap();
@@ -163,7 +206,7 @@ impl ApplicationGUI {
                         }
                     } else {
                         etat.statut = Statut {
-                            texte: format!("Échec envoi : {}", nom),
+                            texte: format!("Échec envoi ({} retries) : {}", retries, nom),
                             couleur: egui::Color32::from_rgb(255, 68, 68),
                         };
                     }
@@ -172,6 +215,7 @@ impl ApplicationGUI {
                     }
                 }
             }
+            info!("Worker d'upload arrêté proprement");
         });
 
         Self {
@@ -183,7 +227,9 @@ impl ApplicationGUI {
             _surveillant: surveillant,
             _serveur_handle: serveur_handle,
             upload_sender,
-            _worker_handle: Some(worker_handle),
+            worker_handle: Some(worker_handle),
+            arret,
+            touche_quitter,
         }
     }
 
@@ -205,6 +251,19 @@ impl ApplicationGUI {
         ) {
             error!("Erreur lancement interface : {}", e);
         }
+    }
+}
+
+impl Drop for ApplicationGUI {
+    fn drop(&mut self) {
+        info!("Arrêt de l'application...");
+        self.arret.store(true, Ordering::Relaxed);
+        // Fermer le canal pour débloquer le worker
+        drop(self.upload_sender.clone());
+        if let Some(handle) = self.worker_handle.take() {
+            let _ = handle.join();
+        }
+        info!("Tous les threads arrêtés");
     }
 }
 
@@ -239,8 +298,8 @@ impl eframe::App for ApplicationGUI {
         };
         // Verrou libéré ici — le worker n'est plus bloqué pendant le rendu
 
-        // Touche Escape pour quitter
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        // Touche configurable pour quitter
+        if ctx.input(|i| i.key_pressed(self.touche_quitter)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
@@ -253,6 +312,8 @@ impl eframe::App for ApplicationGUI {
 
         // Couleur de fond sombre
         let frame_bg = egui::Frame::new().fill(egui::Color32::from_rgb(26, 26, 26));
+
+        let touche_nom = &self.config.interface.touche_quitter;
 
         // --- Barre du haut ---
         egui::TopBottomPanel::top("barre_haut")
@@ -306,10 +367,11 @@ impl eframe::App for ApplicationGUI {
             )
             .show(ctx, |ui| {
                 let info_text = format!(
-                    "Écoute FTP :{}  |  Envoi vers {}  |  Dossier : {}  |  Échap = quitter",
+                    "Écoute FTP :{}  |  Envoi vers {}  |  Dossier : {}  |  {} = quitter",
                     self.config.serveur_ftp.port_ecoute,
                     self.config.ftp_client.host,
-                    self.config.surveillance.repertoire_surveille.display()
+                    self.config.surveillance.repertoire_surveille.display(),
+                    touche_nom,
                 );
                 ui.label(
                     egui::RichText::new(info_text)

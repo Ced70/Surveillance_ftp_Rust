@@ -40,6 +40,8 @@ pub struct FtpClientConfig {
 pub struct InterfaceConfig {
     pub plein_ecran: bool,
     pub touche_quitter: String,
+    pub timeout_fichier_secs: u64,
+    pub retries_upload: u32,
 }
 
 /// Configuration complète de l'application
@@ -136,6 +138,8 @@ impl AppConfig {
             interface: InterfaceConfig {
                 plein_ecran: get_bool(&ini, "interface", "plein_ecran", true),
                 touche_quitter: get_str(&ini, "interface", "touche_quitter", "Escape"),
+                timeout_fichier_secs: get_usize(&ini, "interface", "timeout_fichier_secs", 15) as u64,
+                retries_upload: get_usize(&ini, "interface", "retries_upload", 3) as u32,
             },
         })
     }

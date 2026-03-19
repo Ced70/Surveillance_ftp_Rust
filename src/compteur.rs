@@ -74,10 +74,6 @@ impl CompteurPersistant {
         Self::sauvegarder(&inner);
     }
 
-    pub fn incrementer_supprime(&self) {
-        self.incrementer_supprime_par(1);
-    }
-
     pub fn incrementer_supprime_par(&self, n: u64) {
         let mut inner = self.inner.lock().unwrap();
         inner.total_supprime += n;

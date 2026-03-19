@@ -4448,6 +4448,7 @@ dependencies = [
 name = "surveillance_ftp"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "crossbeam-channel",
  "eframe",

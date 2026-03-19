@@ -44,6 +44,11 @@ impl ClientFTP {
             // Toujours en mode binaire pour les images
             ftp.transfer_type(suppaftp::types::FileType::Binary)?;
 
+            // Configurer le mode de transfert
+            if !self.config.mode_passif {
+                ftp = ftp.active_mode(std::time::Duration::from_secs(60));
+            }
+
             if ftp.cwd(&self.config.dossier_distant).is_err() {
                 self.creer_dossier_recursif(&mut ftp, &self.config.dossier_distant)?;
                 ftp.cwd(&self.config.dossier_distant)?;
@@ -71,9 +76,34 @@ impl ClientFTP {
         Ok(())
     }
 
+    /// Envoie des données avec retry automatique.
+    /// Retourne true si l'envoi a réussi (éventuellement après retry).
+    pub fn envoyer_avec_retry(&mut self, nom_fichier: &str, donnees: &[u8], max_retries: u32) -> bool {
+        for tentative in 0..=max_retries {
+            if tentative > 0 {
+                let delai = std::time::Duration::from_secs(2u64.pow(tentative.min(4)));
+                warn!(
+                    "Retry {}/{} pour {} dans {:?}",
+                    tentative, max_retries, nom_fichier, delai
+                );
+                std::thread::sleep(delai);
+                // Forcer une reconnexion
+                if let Some(mut ftp) = self.connexion.take() {
+                    let _ = ftp.quit();
+                }
+                self.nb_fichiers_distants = None;
+            }
+
+            if self.envoyer_donnees(nom_fichier, donnees) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Envoie des données déjà lues en mémoire vers le serveur FTP.
     /// Réutilise la connexion existante et cache le nombre de fichiers distants.
-    pub fn envoyer_donnees(&mut self, nom_fichier: &str, donnees: &[u8]) -> bool {
+    fn envoyer_donnees(&mut self, nom_fichier: &str, donnees: &[u8]) -> bool {
         if let Err(e) = self.assurer_connexion() {
             error!("Erreur connexion FTP pour {} : {}", nom_fichier, e);
             return false;
