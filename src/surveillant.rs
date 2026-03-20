@@ -85,12 +85,12 @@ impl SurveillantImages {
 }
 
 /// Attend que le fichier soit complètement écrit sur disque.
-/// Vérifie que la taille est stable pendant 3 lectures consécutives espacées de 300ms.
+/// Vérifie que la taille est stable pendant 2 lectures consécutives espacées de 150ms.
 pub fn attendre_fichier_complet(chemin: &Path, timeout: Duration) -> bool {
     let debut = Instant::now();
     let mut taille_precedente: i64 = -1;
     let mut lectures_stables: u32 = 0;
-    const LECTURES_REQUISES: u32 = 3;
+    const LECTURES_REQUISES: u32 = 2;
 
     while debut.elapsed() < timeout {
         match std::fs::metadata(chemin) {
@@ -110,7 +110,7 @@ pub fn attendre_fichier_complet(chemin: &Path, timeout: Duration) -> bool {
                 lectures_stables = 0;
             }
         }
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(150));
     }
 
     // Retourner true si le fichier existe et a une taille > 0

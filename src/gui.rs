@@ -3,7 +3,6 @@ use crate::compteur::CompteurPersistant;
 use crate::config::AppConfig;
 use crate::serveur_ftp::demarrer_serveur_ftp;
 use crate::surveillant::{attendre_fichier_complet, SurveillantImages};
-use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 use log::{error, info, warn};
 use std::path::PathBuf;
@@ -30,12 +29,9 @@ struct EtatPartage {
 pub struct ApplicationGUI {
     config: AppConfig,
     compteur: CompteurPersistant,
-    file_receiver: Receiver<PathBuf>,
-    _file_sender: Sender<PathBuf>,
     etat: Arc<Mutex<EtatPartage>>,
     _surveillant: Option<SurveillantImages>,
     _serveur_handle: Option<std::thread::JoinHandle<()>>,
-    upload_sender: Sender<PathBuf>,
     worker_handle: Option<std::thread::JoinHandle<()>>,
     arret: Arc<AtomicBool>,
     touche_quitter: egui::Key,
@@ -74,8 +70,6 @@ impl ApplicationGUI {
             .join("compteur.json");
         let compteur = CompteurPersistant::new(&compteur_path);
 
-        let (sender, receiver) = crossbeam_channel::unbounded();
-
         // Créer le répertoire surveillé
         let _ = std::fs::create_dir_all(&config.surveillance.repertoire_surveille);
 
@@ -84,19 +78,6 @@ impl ApplicationGUI {
             &config.serveur_ftp,
             &config.surveillance.repertoire_surveille,
         );
-
-        // Démarrer la surveillance watchdog
-        let surveillant = match SurveillantImages::new(
-            &config.surveillance.repertoire_surveille,
-            config.surveillance.extensions.clone(),
-            sender.clone(),
-        ) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                error!("Impossible de démarrer le watcher : {}", e);
-                None
-            }
-        };
 
         let etat = Arc::new(Mutex::new(EtatPartage {
             statut: Statut {
@@ -112,7 +93,21 @@ impl ApplicationGUI {
         let arret = Arc::new(AtomicBool::new(false));
 
         // Canal pour le worker d'upload sérialisé
+        // Le watcher envoie directement dans ce canal, sans intermédiaire GUI
         let (upload_sender, upload_receiver) = crossbeam_channel::unbounded::<PathBuf>();
+
+        // Démarrer la surveillance watchdog (envoie directement dans upload_sender)
+        let surveillant = match SurveillantImages::new(
+            &config.surveillance.repertoire_surveille,
+            config.surveillance.extensions.clone(),
+            upload_sender.clone(),
+        ) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                error!("Impossible de démarrer le watcher : {}", e);
+                None
+            }
+        };
 
         // Le worker possède directement le ClientFTP
         let mut client_ftp = ClientFTP::new(config.ftp_client.clone(), compteur.clone());
@@ -221,12 +216,9 @@ impl ApplicationGUI {
         Self {
             config,
             compteur,
-            file_receiver: receiver,
-            _file_sender: sender,
             etat,
             _surveillant: surveillant,
             _serveur_handle: serveur_handle,
-            upload_sender,
             worker_handle: Some(worker_handle),
             arret,
             touche_quitter,
@@ -258,8 +250,6 @@ impl Drop for ApplicationGUI {
     fn drop(&mut self) {
         info!("Arrêt de l'application...");
         self.arret.store(true, Ordering::Relaxed);
-        // Fermer le canal pour débloquer le worker
-        drop(self.upload_sender.clone());
         if let Some(handle) = self.worker_handle.take() {
             let _ = handle.join();
         }
@@ -301,13 +291,6 @@ impl eframe::App for ApplicationGUI {
         // Touche configurable pour quitter
         if ctx.input(|i| i.key_pressed(self.touche_quitter)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-
-        // Transférer les nouvelles images vers le worker d'upload
-        while let Ok(chemin) = self.file_receiver.try_recv() {
-            if let Err(e) = self.upload_sender.send(chemin) {
-                error!("Erreur envoi vers worker : {}", e);
-            }
         }
 
         // Couleur de fond sombre
