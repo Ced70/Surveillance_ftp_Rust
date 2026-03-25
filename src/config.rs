@@ -3,9 +3,11 @@ use std::path::{Path, PathBuf};
 
 /// Configuration de la section [surveillance]
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct SurveillanceConfig {
     pub repertoire_surveille: PathBuf,
     pub extensions: Vec<String>,
+    /// Obsolete : les images sont maintenant supprimees apres traitement
     pub dossier_envoye: Option<PathBuf>,
 }
 
@@ -35,6 +37,33 @@ pub struct FtpClientConfig {
     pub mode_passif: bool,
 }
 
+/// Configuration de la section [piia]
+#[derive(Clone, Debug)]
+pub struct PiiaConfig {
+    pub actif: bool,
+    pub url: String,
+    pub timeout_ms: u64,
+}
+
+/// Configuration de la section [automate]
+/// Compatible avec la configuration PLC de PIIA
+#[derive(Clone, Debug)]
+pub struct AutomateConfig {
+    pub actif: bool,
+    /// Type de driver : "allen_bradley", "fichier", "tcp", "none"
+    pub driver_type: String,
+    /// Adresse IP de l'automate (Allen-Bradley)
+    pub address: Option<String>,
+    /// Adresse PCCC du tag resultat (ex: "N7:0") — INT : 1=OK, 2=NOK
+    pub result_tag: Option<String>,
+    /// Adresse PCCC du tag heartbeat (ex: "N7:1") — INT : compteur 1..32767
+    pub heartbeat_tag: Option<String>,
+    /// Chemin du fichier resultat (mode fichier)
+    pub fichier_resultat: Option<String>,
+    /// Adresse:port du serveur TCP (mode tcp)
+    pub tcp_adresse: Option<String>,
+}
+
 /// Configuration de la section [interface]
 #[derive(Clone, Debug)]
 pub struct InterfaceConfig {
@@ -50,6 +79,8 @@ pub struct AppConfig {
     pub surveillance: SurveillanceConfig,
     pub serveur_ftp: ServeurFtpConfig,
     pub ftp_client: FtpClientConfig,
+    pub piia: PiiaConfig,
+    pub automate: AutomateConfig,
     pub interface: InterfaceConfig,
 }
 
@@ -134,6 +165,35 @@ impl AppConfig {
                 dossier_distant: ftp_dossier,
                 max_images: get_usize(&ini, "ftp", "max_images", 20000),
                 mode_passif: get_bool(&ini, "ftp", "mode_passif", true),
+            },
+            piia: PiiaConfig {
+                actif: get_bool(&ini, "piia", "actif", false),
+                url: get_str(&ini, "piia", "url", "http://127.0.0.1:3001"),
+                timeout_ms: get_usize(&ini, "piia", "timeout_ms", 1000) as u64,
+            },
+            automate: AutomateConfig {
+                actif: get_bool(&ini, "automate", "actif", false),
+                driver_type: get_str(&ini, "automate", "driver_type", "none"),
+                address: {
+                    let s = get_str(&ini, "automate", "address", "");
+                    if s.is_empty() { None } else { Some(s) }
+                },
+                result_tag: {
+                    let s = get_str(&ini, "automate", "result_tag", "");
+                    if s.is_empty() { None } else { Some(s) }
+                },
+                heartbeat_tag: {
+                    let s = get_str(&ini, "automate", "heartbeat_tag", "");
+                    if s.is_empty() { None } else { Some(s) }
+                },
+                fichier_resultat: {
+                    let s = get_str(&ini, "automate", "fichier_resultat", "");
+                    if s.is_empty() { None } else { Some(s) }
+                },
+                tcp_adresse: {
+                    let s = get_str(&ini, "automate", "tcp_adresse", "");
+                    if s.is_empty() { None } else { Some(s) }
+                },
             },
             interface: InterfaceConfig {
                 plein_ecran: get_bool(&ini, "interface", "plein_ecran", true),

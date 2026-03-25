@@ -1,7 +1,9 @@
 mod client_ftp;
+mod client_piia;
 mod compteur;
 mod config;
 mod gui;
+mod plc;
 mod serveur_ftp;
 mod surveillant;
 

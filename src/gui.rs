@@ -1,10 +1,12 @@
 use crate::client_ftp::ClientFTP;
+use crate::client_piia::ClientPIIA;
 use crate::compteur::CompteurPersistant;
 use crate::config::AppConfig;
+use crate::plc::{self, ResultatPiece};
 use crate::serveur_ftp::demarrer_serveur_ftp;
 use crate::surveillant::{attendre_fichier_complet, SurveillantImages};
 use eframe::egui;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,6 +18,16 @@ struct Statut {
     couleur: egui::Color32,
 }
 
+/// Resultat de l'analyse PIIA pour affichage
+#[derive(Clone)]
+#[allow(dead_code)]
+struct ResultatPiia {
+    piece_ok: bool,
+    global_status: String,
+    processing_time_ms: u64,
+    details: String,
+}
+
 /// État partagé entre le thread worker et l'interface
 struct EtatPartage {
     statut: Statut,
@@ -24,6 +36,8 @@ struct EtatPartage {
     image_a_charger: Option<(String, Arc<[u8]>)>,
     /// Contexte egui pour demander un repaint depuis le worker
     ctx: Option<egui::Context>,
+    /// Dernier resultat PIIA
+    resultat_piia: Option<ResultatPiia>,
 }
 
 pub struct ApplicationGUI {
@@ -87,16 +101,16 @@ impl ApplicationGUI {
             image_texture: None,
             image_a_charger: None,
             ctx: None,
+            resultat_piia: None,
         }));
 
         // Signal d'arrêt pour les threads
         let arret = Arc::new(AtomicBool::new(false));
 
         // Canal pour le worker d'upload sérialisé
-        // Le watcher envoie directement dans ce canal, sans intermédiaire GUI
         let (upload_sender, upload_receiver) = crossbeam_channel::unbounded::<PathBuf>();
 
-        // Démarrer la surveillance watchdog (envoie directement dans upload_sender)
+        // Démarrer la surveillance watchdog
         let surveillant = match SurveillantImages::new(
             &config.surveillance.repertoire_surveille,
             config.surveillance.extensions.clone(),
@@ -109,16 +123,29 @@ impl ApplicationGUI {
             }
         };
 
-        // Le worker possède directement le ClientFTP
+        // Initialiser le client PIIA si actif
+        let client_piia = if config.piia.actif {
+            info!("PIIA actif : {} (timeout={}ms)", config.piia.url, config.piia.timeout_ms);
+            Some(ClientPIIA::new(config.piia.clone()))
+        } else {
+            info!("PIIA desactive");
+            None
+        };
+
+        // Initialiser le driver PLC/automate
+        let mut plc_driver = plc::creer_driver(&config.automate);
+        if let Some(ref mut driver) = plc_driver {
+            info!("Automate {} : connexion...", driver.name());
+            if let Err(e) = driver.connect() {
+                error!("Impossible de connecter l'automate {} : {}", driver.name(), e);
+            }
+        } else {
+            info!("Automate desactive");
+        };
+
         let mut client_ftp = ClientFTP::new(config.ftp_client.clone(), compteur.clone());
         let worker_etat = etat.clone();
-        let worker_config = config.clone();
         let worker_arret = arret.clone();
-
-        // Créer le dossier d'envoi une seule fois si configuré
-        if let Some(ref dossier) = config.surveillance.dossier_envoye {
-            let _ = std::fs::create_dir_all(dossier);
-        }
 
         let timeout_fichier = Duration::from_secs(config.interface.timeout_fichier_secs);
         let retries = config.interface.retries_upload;
@@ -127,7 +154,7 @@ impl ApplicationGUI {
 
         let worker_handle = std::thread::spawn(move || {
             while !worker_arret.load(Ordering::Relaxed) {
-                // Attendre un message avec timeout pour pouvoir vérifier le signal d'arrêt
+                // Attendre un message avec timeout
                 let chemin = match upload_receiver.recv_timeout(Duration::from_secs(1)) {
                     Ok(c) => c,
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
@@ -139,9 +166,13 @@ impl ApplicationGUI {
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
 
+                debug!("Nouvelle image detectee : {} ({})", nom, chemin.display());
+
                 // Attendre que le fichier soit complètement écrit
                 if !attendre_fichier_complet(&chemin, timeout_fichier) {
                     warn!("Fichier incomplet après timeout : {}", chemin.display());
+                    // Supprimer le fichier incomplet
+                    let _ = std::fs::remove_file(&chemin);
                     let mut etat = worker_etat.lock().unwrap();
                     etat.statut = Statut {
                         texte: format!("Fichier incomplet : {}", nom),
@@ -153,7 +184,7 @@ impl ApplicationGUI {
                     continue;
                 }
 
-                // Lire le fichier une seule fois, partager via Arc
+                // Lire le fichier une seule fois
                 let image_data: Arc<[u8]> = match std::fs::read(&chemin) {
                     Ok(data) => data.into(),
                     Err(e) => {
@@ -162,52 +193,153 @@ impl ApplicationGUI {
                     }
                 };
 
-                // Préparer l'affichage (Arc::clone = copie du pointeur, pas des données)
-                {
+                // --- Analyse PIIA (prioritaire) ---
+                if let Some(ref piia) = client_piia {
+                    {
+                        let mut etat = worker_etat.lock().unwrap();
+                        etat.statut = Statut {
+                            texte: format!("Analyse PIIA en cours : {}", nom),
+                            couleur: egui::Color32::from_rgb(255, 170, 0),
+                        };
+                        // Afficher l'image brute en attendant le resultat
+                        etat.image_a_charger = Some((nom.clone(), Arc::clone(&image_data)));
+                        etat.resultat_piia = None;
+                        if let Some(ctx) = &etat.ctx {
+                            ctx.request_repaint();
+                        }
+                    }
+
+                    debug!("Envoi image a PIIA : {} ({} octets)", nom, image_data.len());
+
+                    match piia.analyser(&nom, &image_data) {
+                        Some(resultat) => {
+                            let piece_ok = resultat.piece_ok;
+                            let annotated: Arc<[u8]> = resultat.image_annotee.clone().into();
+
+                            debug!(
+                                "PIIA resultat pour {} : status={}, piece_ok={}, temps={}ms",
+                                nom, resultat.global_status, piece_ok, resultat.processing_time_ms
+                            );
+
+                            // Afficher l'image annotee de PIIA
+                            {
+                                let mut etat = worker_etat.lock().unwrap();
+                                etat.image_a_charger =
+                                    Some((format!("{}_piia", nom), annotated));
+                                etat.resultat_piia = Some(ResultatPiia {
+                                    piece_ok: resultat.piece_ok,
+                                    global_status: resultat.global_status.clone(),
+                                    processing_time_ms: resultat.processing_time_ms,
+                                    details: resultat.details,
+                                });
+                                etat.statut = if piece_ok {
+                                    Statut {
+                                        texte: format!(
+                                            "OK - {} ({}ms)",
+                                            nom, resultat.processing_time_ms
+                                        ),
+                                        couleur: egui::Color32::from_rgb(0, 204, 0),
+                                    }
+                                } else {
+                                    Statut {
+                                        texte: format!(
+                                            "NOK [{}] - {} ({}ms)",
+                                            resultat.global_status, nom, resultat.processing_time_ms
+                                        ),
+                                        couleur: egui::Color32::from_rgb(255, 68, 68),
+                                    }
+                                };
+                                if let Some(ctx) = &etat.ctx {
+                                    ctx.request_repaint();
+                                }
+                            }
+
+                            // Communiquer le resultat a l'automate/PLC
+                            if let Some(ref mut driver) = plc_driver {
+                                let plc_res = if piece_ok { ResultatPiece::Ok } else { ResultatPiece::Nok };
+                                if let Err(e) = driver.write_result(plc_res) {
+                                    error!("Erreur ecriture PLC {} : {}", driver.name(), e);
+                                }
+                            }
+                        }
+                        None => {
+                            // Timeout ou erreur PIIA (non lance, non joignable, etc.)
+                            warn!("PIIA indisponible pour {} - analyse ignoree", nom);
+                            {
+                                let mut etat = worker_etat.lock().unwrap();
+                                etat.statut = Statut {
+                                    texte: format!("PIIA indisponible - {} (analyse ignoree)", nom),
+                                    couleur: egui::Color32::from_rgb(255, 170, 0),
+                                };
+                                etat.resultat_piia = None;
+                                if let Some(ctx) = &etat.ctx {
+                                    ctx.request_repaint();
+                                }
+                            }
+
+                            // Informer l'automate du timeout (= NOK par securite)
+                            if let Some(ref mut driver) = plc_driver {
+                                if let Err(e) = driver.write_result(ResultatPiece::Timeout) {
+                                    error!("Erreur ecriture PLC timeout {} : {}", driver.name(), e);
+                                }
+                            }
+
+                            // On continue quand meme avec l'envoi FTP pour archivage
+                        }
+                    }
+                } else {
+                    // Pas de PIIA - afficher l'image brute
                     let mut etat = worker_etat.lock().unwrap();
                     etat.image_a_charger = Some((nom.clone(), Arc::clone(&image_data)));
                     etat.statut = Statut {
                         texte: format!("Envoi en cours : {}", nom),
                         couleur: egui::Color32::from_rgb(255, 170, 0),
                     };
+                    etat.resultat_piia = None;
                     if let Some(ctx) = &etat.ctx {
                         ctx.request_repaint();
                     }
                 }
 
-                // Envoyer via FTP avec retry
+                // Supprimer l'image source immediatement (donnees deja en memoire)
+                // Evite de surcharger le disque local
+                if chemin.exists() {
+                    if let Err(e) = std::fs::remove_file(&chemin) {
+                        warn!("Impossible de supprimer {} : {}", chemin.display(), e);
+                    } else {
+                        info!("Image source supprimee : {}", chemin.display());
+                    }
+                }
+
+                // --- Envoi FTP (apres analyse PIIA) ---
                 let succes = client_ftp.envoyer_avec_retry(&nom, &image_data, retries);
 
                 {
                     let mut etat = worker_etat.lock().unwrap();
                     if succes {
-                        etat.statut = Statut {
-                            texte: format!("Envoyé : {}", nom),
-                            couleur: egui::Color32::from_rgb(0, 204, 0),
-                        };
-                        if let Some(ref dossier) = worker_config.surveillance.dossier_envoye {
-                            if let Some(nom_fichier) = chemin.file_name() {
-                                let destination = dossier.join(nom_fichier);
-                                if let Err(e) = std::fs::rename(&chemin, &destination) {
-                                    error!(
-                                        "Impossible de déplacer {} : {}",
-                                        chemin.display(),
-                                        e
-                                    );
-                                } else {
-                                    info!("Image déplacée vers : {}", destination.display());
-                                }
-                            }
+                        // Garder le statut PIIA s'il existe, sinon afficher envoi OK
+                        if etat.resultat_piia.is_none() {
+                            etat.statut = Statut {
+                                texte: format!("Envoyé : {}", nom),
+                                couleur: egui::Color32::from_rgb(0, 204, 0),
+                            };
                         }
                     } else {
                         etat.statut = Statut {
-                            texte: format!("Échec envoi ({} retries) : {}", retries, nom),
+                            texte: format!("Échec envoi FTP ({} retries) : {}", retries, nom),
                             couleur: egui::Color32::from_rgb(255, 68, 68),
                         };
                     }
                     if let Some(ctx) = &etat.ctx {
                         ctx.request_repaint();
                     }
+                }
+            }
+            // Deconnecter le PLC proprement
+            if let Some(ref mut driver) = plc_driver {
+                info!("Deconnexion automate {}...", driver.name());
+                if let Err(e) = driver.disconnect() {
+                    error!("Erreur deconnexion PLC : {}", e);
                 }
             }
             info!("Worker d'upload arrêté proprement");
@@ -230,14 +362,14 @@ impl ApplicationGUI {
 
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_title("Surveillance FTP")
+                .with_title("Surveillance FTP + PIIA")
                 .with_inner_size([1024.0, 768.0])
                 .with_fullscreen(plein_ecran),
             ..Default::default()
         };
 
         if let Err(e) = eframe::run_native(
-            "Surveillance FTP",
+            "Surveillance FTP + PIIA",
             options,
             Box::new(|_cc| Ok(Box::new(self))),
         ) {
@@ -259,8 +391,8 @@ impl Drop for ApplicationGUI {
 
 impl eframe::App for ApplicationGUI {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Une seule prise de verrou pour : ctx, texture, statut
-        let (statut_texte, statut_couleur, texture) = {
+        // Une seule prise de verrou
+        let (statut_texte, statut_couleur, texture, resultat_piia) = {
             let mut etat = self.etat.lock().unwrap();
             if etat.ctx.is_none() {
                 etat.ctx = Some(ctx.clone());
@@ -279,14 +411,13 @@ impl eframe::App for ApplicationGUI {
                 }
             }
 
-            // Copier les données nécessaires au rendu, puis libérer le verrou
             (
                 etat.statut.texte.clone(),
                 etat.statut.couleur,
                 etat.image_texture.clone(),
+                etat.resultat_piia.clone(),
             )
         };
-        // Verrou libéré ici — le worker n'est plus bloqué pendant le rendu
 
         // Touche configurable pour quitter
         if ctx.input(|i| i.key_pressed(self.touche_quitter)) {
@@ -307,6 +438,33 @@ impl eframe::App for ApplicationGUI {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    // Indicateur OK/NOK bien visible
+                    if let Some(ref res) = resultat_piia {
+                        let (badge_text, badge_color) = if res.piece_ok {
+                            (" OK ", egui::Color32::from_rgb(0, 180, 0))
+                        } else {
+                            (" NOK ", egui::Color32::from_rgb(220, 0, 0))
+                        };
+
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(60.0, 28.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().rect_filled(
+                            rect,
+                            6.0,
+                            badge_color,
+                        );
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            badge_text.trim(),
+                            egui::FontId::proportional(18.0),
+                            egui::Color32::WHITE,
+                        );
+                        ui.add_space(10.0);
+                    }
+
                     ui.label(
                         egui::RichText::new(&statut_texte)
                             .color(statut_couleur)
@@ -349,18 +507,43 @@ impl eframe::App for ApplicationGUI {
                     .inner_margin(egui::Margin::symmetric(10, 5)),
             )
             .show(ctx, |ui| {
-                let info_text = format!(
-                    "Écoute FTP :{}  |  Envoi vers {}  |  Dossier : {}  |  {} = quitter",
-                    self.config.serveur_ftp.port_ecoute,
-                    self.config.ftp_client.host,
-                    self.config.surveillance.repertoire_surveille.display(),
-                    touche_nom,
-                );
-                ui.label(
-                    egui::RichText::new(info_text)
-                        .color(egui::Color32::from_rgb(119, 119, 119))
-                        .size(10.0),
-                );
+                ui.horizontal(|ui| {
+                    let info_text = format!(
+                        "FTP :{}  |  Envoi vers {}  |  Dossier : {}  |  {} = quitter",
+                        self.config.serveur_ftp.port_ecoute,
+                        self.config.ftp_client.host,
+                        self.config.surveillance.repertoire_surveille.display(),
+                        touche_nom,
+                    );
+                    ui.label(
+                        egui::RichText::new(info_text)
+                            .color(egui::Color32::from_rgb(119, 119, 119))
+                            .size(10.0),
+                    );
+
+                    if self.config.piia.actif {
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "PIIA: {} (timeout {}ms)",
+                                self.config.piia.url, self.config.piia.timeout_ms
+                            ))
+                            .color(egui::Color32::from_rgb(0, 170, 255))
+                            .size(10.0),
+                        );
+                    }
+
+                    // Afficher le temps de traitement PIIA
+                    if let Some(ref res) = resultat_piia {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("PIIA: {}ms", res.processing_time_ms))
+                                    .color(egui::Color32::from_rgb(170, 170, 170))
+                                    .size(10.0),
+                            );
+                        });
+                    }
+                });
             });
 
         // --- Zone image centrale ---
@@ -385,7 +568,7 @@ impl eframe::App for ApplicationGUI {
             }
         });
 
-        // Refresh régulier pour vérifier les nouvelles images
+        // Refresh régulier
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
 }
